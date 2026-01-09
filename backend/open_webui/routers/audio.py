@@ -5,6 +5,7 @@ import os
 import uuid
 import html
 import base64
+import asyncio
 from functools import lru_cache
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
@@ -53,6 +54,7 @@ from open_webui.env import (
     ENV,
     AIOHTTP_CLIENT_SESSION_SSL,
     AIOHTTP_CLIENT_TIMEOUT,
+    SRC_LOG_LEVELS,
     DEVICE_TYPE,
     ENABLE_FORWARD_USER_INFO_HEADERS,
 )
@@ -66,10 +68,16 @@ MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024  # Convert MB to bytes
 AZURE_MAX_FILE_SIZE_MB = 200
 AZURE_MAX_FILE_SIZE = AZURE_MAX_FILE_SIZE_MB * 1024 * 1024  # Convert MB to bytes
 
+# Async transcription constants
+MAX_CHUNK_DURATION_MS = 60000  # 60 seconds max per chunk for duration-based splitting
+MAX_CONCURRENT_TRANSCRIPTIONS = 5  # Limit parallel requests to STT server
+
 log = logging.getLogger(__name__)
+log.setLevel(SRC_LOG_LEVELS["AUDIO"])
 
 SPEECH_CACHE_DIR = CACHE_DIR / "audio" / "speech"
 SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 
 ##########################################
@@ -1043,6 +1051,165 @@ def transcription_handler(request, file_path, metadata, user=None):
             )
 
 
+async def transcription_handler_async(request, file_path, metadata, user=None):
+    """
+    Async version of transcription_handler for OpenAI-compatible STT APIs.
+    Uses aiohttp for non-blocking HTTP requests.
+    """
+    filename = os.path.basename(file_path)
+    file_dir = os.path.dirname(file_path)
+    id = filename.split(".")[0]
+
+    metadata = metadata or {}
+
+    # Language fallback list (same as sync version)
+    languages = [
+        metadata.get("language", None) if not WHISPER_LANGUAGE else WHISPER_LANGUAGE,
+        None,  # Always fallback to None in case transcription fails
+    ]
+
+    # Only supports OpenAI engine for async
+    if request.app.state.config.STT_ENGINE != "openai":
+        # Fall back to sync handler for non-OpenAI engines
+        return await asyncio.to_thread(
+            transcription_handler, request, file_path, metadata, user
+        )
+
+    last_error = None
+    try:
+        timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            trust_env=True
+        ) as session:
+            # Build headers
+            headers = {
+                "Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"
+            }
+            if user and ENABLE_FORWARD_USER_INFO_HEADERS:
+                headers = include_user_info_headers(headers, user)
+
+            # Read file content once
+            with open(file_path, "rb") as f:
+                file_content = f.read()
+
+            # Try with language fallback (same as sync version)
+            for language in languages:
+                # Build multipart form data (OpenAI-compatible structure)
+                form = aiohttp.FormData()
+                form.add_field(
+                    "file",
+                    file_content,
+                    filename=filename,
+                    content_type="audio/mpeg"
+                )
+                form.add_field("model", request.app.state.config.STT_MODEL)
+                if language:
+                    form.add_field("language", language)
+
+                async with session.post(
+                    url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
+                    data=form,
+                    headers=headers,
+                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+
+                        # Save the transcript to a json file
+                        transcript_file = f"{file_dir}/{id}.json"
+                        async with aiofiles.open(transcript_file, "w") as f:
+                            await f.write(json.dumps(data))
+
+                        return data
+                    else:
+                        # Store error for potential retry
+                        error_text = await r.text()
+                        try:
+                            error_json = await r.json()
+                            if "error" in error_json:
+                                last_error = f"External: {error_json['error'].get('message', error_text)}"
+                            else:
+                                last_error = f"External: {error_text}"
+                        except Exception:
+                            last_error = f"External: {error_text}"
+                        log.warning(f"STT API error with language={language}: {r.status} - {last_error}")
+                        # Continue to next language in fallback
+
+            # If we get here, all language attempts failed
+            raise Exception(last_error if last_error else "Open WebUI: Server Connection Error")
+
+    except asyncio.TimeoutError:
+        log.error(f"Timeout while transcribing {filename}")
+        raise Exception("Timeout while transcribing audio chunk")
+    except Exception as e:
+        log.exception(e)
+        raise Exception(str(e) if str(e) else "Open WebUI: Server Connection Error")
+
+
+async def transcribe_async(
+    request: Request, file_path: str, metadata: Optional[dict] = None, user=None
+):
+    """
+    Async version of transcribe that processes chunks in parallel using asyncio.gather.
+    """
+    log.info(f"transcribe_async: {file_path} {metadata}")
+
+    # Offload CPU-bound audio processing to thread
+    if is_audio_conversion_required(file_path):
+        file_path = await asyncio.to_thread(convert_audio_to_mp3, file_path)
+
+    try:
+        file_path = await asyncio.to_thread(compress_audio, file_path)
+    except Exception as e:
+        log.exception(e)
+
+    # Split audio by duration for faster processing
+    try:
+        chunk_paths = await asyncio.to_thread(
+            split_audio_by_duration, file_path, MAX_CHUNK_DURATION_MS
+        )
+        log.info(f"Split audio into {len(chunk_paths)} chunks")
+    except Exception as e:
+        log.exception(e)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT(e),
+        )
+
+    # Use semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
+
+    async def process_chunk(chunk_path):
+        async with semaphore:
+            return await transcription_handler_async(request, chunk_path, metadata, user)
+
+    # Process all chunks in parallel
+    try:
+        tasks = [process_chunk(chunk_path) for chunk_path in chunk_paths]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Check for exceptions in results
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error transcribing chunk {i}: {result}",
+                )
+    finally:
+        # Clean up only the temporary chunks, never the original file
+        for chunk_path in chunk_paths:
+            if chunk_path != file_path and os.path.isfile(chunk_path):
+                try:
+                    os.remove(chunk_path)
+                except Exception:
+                    pass
+
+    return {
+        "text": " ".join([result["text"] for result in results]),
+    }
+
+
 def transcribe(
     request: Request, file_path: str, metadata: Optional[dict] = None, user=None
 ):
@@ -1059,7 +1226,7 @@ def transcribe(
     # Always produce a list of chunk paths (could be one entry if small)
     try:
         chunk_paths = split_audio(file_path, MAX_FILE_SIZE)
-        print(f"Chunk paths: {chunk_paths}")
+        log.debug(f"Chunk paths: {chunk_paths}")
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -1162,8 +1329,37 @@ def split_audio(file_path, max_bytes, format="mp3", bitrate="32k"):
     return chunks
 
 
+def split_audio_by_duration(file_path, max_duration_ms, format="mp3", bitrate="32k"):
+    """
+    Splits audio into chunks not exceeding max_duration_ms.
+    Returns a list of chunk file paths. If audio fits, returns list with original path.
+    """
+    audio = AudioSegment.from_file(file_path)
+    duration_ms = len(audio)
+
+    if duration_ms <= max_duration_ms:
+        return [file_path]  # Nothing to split
+
+    chunks = []
+    start = 0
+    i = 0
+    base, _ = os.path.splitext(file_path)
+
+    while start < duration_ms:
+        end = min(start + max_duration_ms, duration_ms)
+        chunk = audio[start:end]
+        chunk_path = f"{base}_chunk_{i}.{format}"
+        chunk.export(chunk_path, format=format, bitrate=bitrate)
+        chunks.append(chunk_path)
+        start = end
+        i += 1
+
+    log.info(f"Split audio into {len(chunks)} chunks by duration (max {max_duration_ms}ms)")
+    return chunks
+
+
 @router.post("/transcriptions")
-def transcription(
+async def transcription(
     request: Request,
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
@@ -1213,7 +1409,14 @@ def transcription(
             if language:
                 metadata = {"language": language}
 
-            result = transcribe(request, file_path, metadata, user)
+            # Use async transcribe for OpenAI engine (parallel processing)
+            if request.app.state.config.STT_ENGINE == "openai":
+                result = await transcribe_async(request, file_path, metadata, user)
+            else:
+                # Fall back to sync transcribe for other engines
+                result = await asyncio.to_thread(
+                    transcribe, request, file_path, metadata, user
+                )
 
             return {
                 **result,
