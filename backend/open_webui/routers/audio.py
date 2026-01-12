@@ -5,6 +5,7 @@ import os
 import uuid
 import html
 import base64
+import asyncio
 from functools import lru_cache
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
@@ -563,6 +564,89 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         return FileResponse(file_path)
 
 
+
+
+async def transcription_handler_async(request, file_path, metadata, user=None):
+    """
+    Async version of transcription_handler for OpenAI STT engine.
+    Uses aiohttp for non-blocking HTTP requests with timeout.
+    """
+    filename = os.path.basename(file_path)
+    file_dir = os.path.dirname(file_path)
+    id = filename.split(".")[0]
+
+    metadata = metadata or {}
+
+    languages = [
+        metadata.get("language", None) if not WHISPER_LANGUAGE else WHISPER_LANGUAGE,
+        None,  # Always fallback to None in case transcription fails
+    ]
+
+    if request.app.state.config.STT_ENGINE == "openai":
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)  # 20 second timeout per chunk
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                for language in languages:
+                    payload_data = {
+                        "model": request.app.state.config.STT_MODEL,
+                    }
+
+                    if language:
+                        payload_data["language"] = language
+
+                    headers = {
+                        "Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"
+                    }
+                    if user and ENABLE_FORWARD_USER_INFO_HEADERS:
+                        headers = include_user_info_headers(headers, user)
+
+                    # Prepare multipart form data
+                    with open(file_path, "rb") as audio_file:
+                        form = aiohttp.FormData()
+                        form.add_field(
+                            "file",
+                            audio_file,
+                            filename=filename,
+                            content_type="application/octet-stream"
+                        )
+                        form.add_field("model", payload_data["model"])
+                        if language:
+                            form.add_field("language", language)
+
+                        async with session.post(
+                            url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
+                            headers=headers,
+                            data=form,
+                            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                        ) as r:
+                            if r.status == 200:
+                                data = await r.json()
+
+                                # Save the transcript to a json file
+                                transcript_file = f"{file_dir}/{id}.json"
+                                with open(transcript_file, "w") as f:
+                                    json.dump(data, f)
+
+                                log.debug(f"Async transcription successful for {filename}")
+                                return data
+                            elif r.status != 200:
+                                # If not successful, try next language
+                                continue
+
+                # If we get here, all language attempts failed
+                raise Exception(f"Transcription failed for all language attempts")
+
+        except asyncio.TimeoutError as e:
+            log.exception(f"Async transcription timeout for {filename}")
+            raise Exception(f"Transcription timeout after 20 seconds: {e}")
+        except Exception as e:
+            log.exception(f"Async transcription error for {filename}")
+            raise Exception(f"Open WebUI: Server Connection Error - {e}")
+    else:
+        # For non-OpenAI engines, fall back to sync handler
+        return transcription_handler(request, file_path, metadata, user)
+
+
 def transcription_handler(request, file_path, metadata, user=None):
     filename = os.path.basename(file_path)
     file_dir = os.path.dirname(file_path)
@@ -620,11 +704,14 @@ def transcription_handler(request, file_path, metadata, user=None):
                 if user and ENABLE_FORWARD_USER_INFO_HEADERS:
                     headers = include_user_info_headers(headers, user)
 
+                # Using synchronous requests (will be replaced in Phase 2 with full async)
+                # For now keeping compatibility while preparing for async migration
                 r = requests.post(
                     url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
                     headers=headers,
                     files={"file": (filename, open(file_path, "rb"))},
                     data=payload,
+                    timeout=20,  # Add 20 second timeout to prevent indefinite blocking
                 )
 
                 if r.status_code == 200:
@@ -1024,6 +1111,68 @@ def transcription_handler(request, file_path, metadata, user=None):
             )
 
 
+
+
+async def transcribe_async(
+    request: Request, file_path: str, metadata: Optional[dict] = None, user=None
+):
+    """
+    Async version of transcribe function for concurrent chunk processing.
+    Used for OpenAI STT engine to prevent timeout issues.
+    """
+    log.info(f"transcribe_async: {file_path} {metadata}")
+
+    # Audio preprocessing (sync operations - CPU bound)
+    if is_audio_conversion_required(file_path):
+        file_path = convert_audio_to_mp3(file_path)
+
+    try:
+        file_path = compress_audio(file_path)
+    except Exception as e:
+        log.exception(e)
+
+    # Chunking
+    try:
+        chunk_paths = split_audio(file_path, MAX_FILE_SIZE)
+        log.info(f"Async chunk paths: {chunk_paths}")
+    except Exception as e:
+        log.exception(e)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT(e),
+        )
+
+    results = []
+    try:
+        # Create async tasks for concurrent processing
+        tasks = [
+            transcription_handler_async(request, chunk_path, metadata, user)
+            for chunk_path in chunk_paths
+        ]
+        
+        # Process all chunks concurrently
+        results = await asyncio.gather(*tasks)
+        
+    except Exception as transcribe_exc:
+        log.exception(f"Error in async transcription: {transcribe_exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error transcribing: {transcribe_exc}",
+        )
+    finally:
+        # Clean up only the temporary chunks, never the original file
+        for chunk_path in chunk_paths:
+            if chunk_path != file_path and os.path.isfile(chunk_path):
+                try:
+                    os.remove(chunk_path)
+                except Exception:
+                    pass
+
+    return {
+        "text": " ".join([result["text"] for result in results]),
+    }
+
+
 def transcribe(
     request: Request, file_path: str, metadata: Optional[dict] = None, user=None
 ):
@@ -1144,7 +1293,7 @@ def split_audio(file_path, max_bytes, format="mp3", bitrate="32k"):
 
 
 @router.post("/transcriptions")
-def transcription(
+async def transcription(
     request: Request,
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
@@ -1181,7 +1330,12 @@ def transcription(
             if language:
                 metadata = {"language": language}
 
-            result = transcribe(request, file_path, metadata, user)
+            # Use async version for OpenAI engine (better performance)
+            if request.app.state.config.STT_ENGINE == "openai":
+                result = await transcribe_async(request, file_path, metadata, user)
+            else:
+                # Use sync version for other engines
+                result = transcribe(request, file_path, metadata, user)
 
             return {
                 **result,
