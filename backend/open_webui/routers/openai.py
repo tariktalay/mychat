@@ -61,13 +61,26 @@ log = logging.getLogger(__name__)
 ##########################################
 
 
-async def send_get_request(url, key=None, user: UserModel = None):
+async def send_get_request(
+    url, key=None, user: UserModel = None, request: Request = None, config: dict = None
+):
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            headers = {
-                **({"Authorization": f"Bearer {key}"} if key else {}),
-            }
+            # Use get_headers_and_cookies if request and config are provided
+            if request is not None and config is not None:
+                try:
+                    headers, cookies = await get_headers_and_cookies(
+                        request, url, key, config, user=user
+                    )
+                except Exception as e:
+                    log.error(f"Error in get_headers_and_cookies: {e}")
+                    headers = {**({"Authorization": f"Bearer {key}"} if key else {})}
+                    cookies = {}
+            else:
+                # Fallback to basic auth for backward compatibility
+                headers = {**({"Authorization": f"Bearer {key}"} if key else {})}
+                cookies = {}
 
             if ENABLE_FORWARD_USER_INFO_HEADERS and user:
                 headers = include_user_info_headers(headers, user)
@@ -75,6 +88,7 @@ async def send_get_request(url, key=None, user: UserModel = None):
             async with session.get(
                 url,
                 headers=headers,
+                cookies=cookies,
                 ssl=AIOHTTP_CLIENT_SESSION_SSL,
             ) as response:
                 return await response.json()
@@ -367,6 +381,8 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
                     f"{url}/models",
                     request.app.state.config.OPENAI_API_KEYS[idx],
                     user=user,
+                    request=request,
+                    config={},
                 )
             )
         else:
@@ -387,6 +403,8 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
                             f"{url}/models",
                             request.app.state.config.OPENAI_API_KEYS[idx],
                             user=user,
+                            request=request,
+                            config=api_config,
                         )
                     )
                 else:
